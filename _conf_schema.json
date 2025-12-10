@@ -1,0 +1,81 @@
+{
+    "queqiao_server": {
+        "description": "服务器设置",
+        "type": "object",
+        "hint": "queqiao server config",
+        "items": {
+            "server_name": {
+                "description": "服务端 Server name",
+                "type": "string",
+                "hint": "务必和 config.json 中的 server_name 保持一致.",
+                "default": "Server"
+            },
+            "server_uri": {
+                "description": "服务端地址 URI",
+                "type": "string",
+                "hint": "ws://***:8080/minecraft/ws",
+                "default": "ws://127.0.0.1:8080/minecraft/ws"
+            },
+            "access_token": {
+                "description": "身份认证 Access token",
+                "type": "string",
+                "hint": "config.json 中的 access_token, 没有设置可不填."
+            }
+        }
+    },
+    "connection_policy": {
+        "description": "连接设置",
+        "type": "object",
+        "hint": "connection policy",
+        "items": {
+            "max_reconnect_attempts": {
+                "description": "最大重试次数",
+                "type": "int",
+                "hint": "Default retry attempts: 5",
+                "default": 5
+            },
+            "reconnect_interval": {
+                "description": "重试间隔 (秒)",
+                "type": "int",
+                "hint": "Default retry interval: 60 seconds",
+                "default": 60
+            }
+        }
+    },
+    "notification": {
+        "description": "通知设置",
+        "type": "object",
+        "hint": "notification config",
+        "items": {
+          "umo_list": {
+            "description": "通知群组umo (通过 /sid 获取)",
+            "type": "list",
+            "default": []
+          },
+          "enabled_events": {
+            "description": "启用的通知类型",
+            "type": "list",
+            "options": [
+              "玩家加入|PlayerJoinEvent",
+              "玩家退出|PlayerQuitEvent",
+              "玩家死亡|PlayerDeathEvent",
+              "玩家成就|PlayerAchievementEvent",
+              "玩家聊天|PlayerChatEvent",
+              "玩家命令|PlayerCommandEvent"
+            ]
+          },
+          "min_merge_window": {
+            "description": "最小合并窗口 (秒)",
+            "hint": "抵消快速上下线事件，合并连续发送消息，会引入该长度的基础通知延迟，设置为 0 时不工作。",
+            "type": "int",
+            "default": 10
+          },
+          "max_merge_window": {
+            "description": "最大合并窗口 (秒)",
+            "hint": " 消息抵达后最长等待时间，超过该时间则立即发送通知。",
+            "type": "int",
+            "default": 60
+          }
+        }
+    }
+}
