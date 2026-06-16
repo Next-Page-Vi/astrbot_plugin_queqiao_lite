@@ -1,39 +1,42 @@
 import json
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
-
 from astrbot.api import logger
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
+
+from .types import JsonObject, JsonValue, RawQueqiaoPayload
+
+SUCCESS_CODE = 200
 
 
 class QueqiaoApiBaseModelMixin:
     model_config = ConfigDict(extra="ignore")
 
     @staticmethod
-    def normalize_nullish(data: Any) -> Any:
+    def normalize_nullish(data: JsonValue) -> JsonValue:
         """递归将空字符串转 None"""
         if isinstance(data, dict):
             return {
-                k: QueqiaoApiBaseModelMixin.normalize_nullish(v)
-                if v == "" or isinstance(v, (dict, list))
-                else v
-                for k, v in data.items()
+                key: QueqiaoApiBaseModelMixin.normalize_nullish(value)
+                for key, value in data.items()
             }
-        elif isinstance(data, list):
-            return [
-                QueqiaoApiBaseModelMixin.normalize_nullish(v)
-                if v == "" or isinstance(v, (dict, list))
-                else v
-                for v in data
-            ]
-        elif data == "":
+        if isinstance(data, list):
+            return [QueqiaoApiBaseModelMixin.normalize_nullish(value) for value in data]
+        if data == "":
             return None
         return data
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_nullish(cls, data: Any) -> Any:
+    def _normalize_nullish(cls, data: JsonValue) -> JsonValue:
         return cls.normalize_nullish(data)
 
 
@@ -44,11 +47,11 @@ class QueqiaoApiResponse(QueqiaoApiBaseModelMixin, BaseModel):
     status: str | None = None
     message: str | None = None
     echo: str | None = None
-    data: Any = None
+    data: JsonValue = None
 
     @property
     def is_success(self) -> bool:
-        return self.code == 200 and (self.status or "").upper() == "SUCCESS"
+        return self.code == SUCCESS_CODE and (self.status or "").upper() == "SUCCESS"
 
     @property
     def error_text(self) -> str:
@@ -120,15 +123,15 @@ _api_response_adapter: TypeAdapter[ApiResponseUnion] = TypeAdapter(ApiResponseUn
 
 
 class ApiHandler:
-    def __init__(self, response: Any) -> None:
+    def __init__(self, response: RawQueqiaoPayload) -> None:
         self.response = response
 
     @staticmethod
-    def is_api_response_payload(payload: dict[str, Any]) -> bool:
+    def is_api_response_payload(payload: JsonObject) -> bool:
         return payload.get("post_type") == "response"
 
     @staticmethod
-    def _decode_response(response: Any) -> str | None:
+    def _decode_response(response: RawQueqiaoPayload) -> str | None:
         try:
             if response is None:
                 return None
@@ -137,7 +140,7 @@ class ApiHandler:
             if isinstance(response, str):
                 return response
             return json.dumps(response, ensure_ascii=False)
-        except Exception:
+        except (TypeError, UnicodeDecodeError):
             logger.exception("无法解码 QueQiao API 响应")
             return None
 
@@ -148,11 +151,11 @@ class ApiHandler:
 
         try:
             return _api_response_adapter.validate_json(text)
-        except Exception:
+        except (ValidationError, ValueError):
             logger.debug("使用具体 API 响应模型解析失败，回退到通用响应模型")
 
         try:
             return QueqiaoApiResponse.model_validate_json(text)
-        except Exception:
+        except (ValidationError, ValueError):
             logger.exception("解析 QueQiao API 响应失败")
             return None

@@ -1,23 +1,23 @@
-from typing import Any
 from uuid import UUID
 
+from astrbot.api import logger
+
 from .api_handler import ApiHandler, QueqiaoApiResponse
+from .types import JsonArray, JsonObject
 from .websocket import QueqiaoClient
 
-from astrbot.api import logger
 
 class QueqiaoApi:
     def __init__(self, client: QueqiaoClient) -> None:
         self.client = client
 
     @staticmethod
-    def _plain_message(message: str) -> list[dict[str, str]]:
-        return [
-            {
-                "text": message,
-                "color": "white",
-            }
-        ]
+    def _plain_message(message: str) -> JsonArray:
+        component: JsonObject = {
+            "text": message,
+            "color": "white",
+        }
+        return [component]
 
     @staticmethod
     def _parse_player_target(target: str) -> tuple[str | None, str | None]:
@@ -27,7 +27,9 @@ class QueqiaoApi:
             return None, target
 
     async def _request(
-        self, api: str, data: dict[str, Any]
+        self,
+        api: str,
+        data: JsonObject,
     ) -> QueqiaoApiResponse | None:
         response = await self.client.send_api_request(api, data)
         logger.debug(response)
@@ -37,22 +39,26 @@ class QueqiaoApi:
         return await self._request("get_status", {})
 
     async def broadcast(self, message: str) -> QueqiaoApiResponse | None:
+        data: JsonObject = {
+            "message": self._plain_message(message),
+        }
         return await self._request(
             "broadcast",
-            {
-                "message": self._plain_message(message),
-            },
+            data,
         )
 
     async def send_private_msg(
-        self, target: str, message: str
+        self,
+        target: str,
+        message: str,
     ) -> QueqiaoApiResponse | None:
         uuid, nickname = self._parse_player_target(target)
+        data: JsonObject = {
+            "uuid": uuid,
+            "nickname": nickname,
+            "message": self._plain_message(message),
+        }
         return await self._request(
             "send_private_msg",
-            {
-                "uuid": uuid,
-                "nickname": nickname,
-                "message": self._plain_message(message),
-            },
+            data,
         )

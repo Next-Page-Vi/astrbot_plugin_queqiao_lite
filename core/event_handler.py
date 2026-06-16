@@ -1,40 +1,31 @@
-import json
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
-from websockets import Data
-
 from astrbot.api import logger
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+
+from .types import JsonValue
 
 
 class QueqiaoBaseModelMixin:
     model_config = ConfigDict(extra="ignore")
 
     @staticmethod
-    def normalize_nullish(data: Any) -> Any:
+    def normalize_nullish(data: JsonValue) -> JsonValue:
         """递归将空字符串转 None"""
         if isinstance(data, dict):
             return {
-                k: QueqiaoBaseModelMixin.normalize_nullish(v)
-                if v == "" or isinstance(v, (dict, list))
-                else v
-                for k, v in data.items()
+                key: QueqiaoBaseModelMixin.normalize_nullish(value) for key, value in data.items()
             }
-        elif isinstance(data, list):
-            return [
-                QueqiaoBaseModelMixin.normalize_nullish(v)
-                if v == "" or isinstance(v, (dict, list))
-                else v
-                for v in data
-            ]
-        elif data == "":
+        if isinstance(data, list):
+            return [QueqiaoBaseModelMixin.normalize_nullish(value) for value in data]
+        if data == "":
             return None
         return data
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_nullish(cls, data: Any) -> Any:
+    def _normalize_nullish(cls, data: JsonValue) -> JsonValue:
         return cls.normalize_nullish(data)
 
 
@@ -159,27 +150,19 @@ EventUnion = Annotated[
 _event_adapter: TypeAdapter[EventUnion] = TypeAdapter(EventUnion)
 
 
+class MessageSink(Protocol):
+    async def add_message(self, event: EventUnion) -> None: ...
+
+
 class EventHandler:
-    def __init__(self, context, message: Data, message_manager) -> None:
-        self.context = context
+    def __init__(self, message: str, message_manager: MessageSink) -> None:
         self.message = message
         self.message_manager = message_manager
 
     async def process(self) -> None:
         try:
-            if isinstance(self.message, (bytes, bytearray)):
-                text = self.message.decode("utf-8")
-            elif isinstance(self.message, str):
-                text = self.message
-            else:
-                text = json.dumps(self.message)
-        except Exception:
-            logger.exception("无法解码 WebSocket 消息为文本")
-            return
-
-        try:
-            event = _event_adapter.validate_json(text)
-        except Exception:
+            event = _event_adapter.validate_json(self.message)
+        except (ValidationError, ValueError):
             logger.exception("使用 discriminator 解析事件失败")
             return
 

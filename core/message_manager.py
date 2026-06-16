@@ -1,10 +1,10 @@
 import asyncio
 import time
-from typing import Any
 
-import astrbot.api.message_components as Comp
+import astrbot.api.message_components as comp
 from astrbot import logger
 from astrbot.api.event import MessageChain
+from astrbot.api.star import Context
 
 from .api_handler import (
     BroadcastResponse,
@@ -22,17 +22,24 @@ from .event_handler import (
     PlayerQuitEvent,
 )
 
+type QueuedEvent = tuple[EventUnion, int]
+
 
 class MessageManager:
     def __init__(
-        self, context, enabled_sub_types, umo_list, min_merge_window, max_merge_window
+        self,
+        context: Context,
+        enabled_sub_types: list[str],
+        umo_list: list[str],
+        min_merge_window: int,
+        max_merge_window: int,
     ) -> None:
         self.context = context
         self.enabled_sub_types = enabled_sub_types
         self.umo_list = umo_list
         self.min_merge_window = min_merge_window
         self.max_merge_window = max_merge_window
-        self.notification_queue: list[tuple[EventUnion, int]] = []
+        self.notification_queue: list[QueuedEvent] = []
         self._running_flag = True
 
     @staticmethod
@@ -42,7 +49,7 @@ class MessageManager:
         return response.error_text
 
     @staticmethod
-    def _format_number(value: Any) -> str:
+    def _format_number(value: float | None) -> str:
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
         if isinstance(value, int):
@@ -57,9 +64,7 @@ class MessageManager:
         if not isinstance(response, GetStatusResponse):
             return "查询在线人数失败：服务端返回的不是 get_status 响应。"
 
-        server_list_ping = (
-            response.data.server_list_ping if response.data is not None else None
-        )
+        server_list_ping = response.data.server_list_ping if response.data is not None else None
         if server_list_ping is None or server_list_ping.players is None:
             return "已查询服务器状态，但响应中没有在线人数信息。"
 
@@ -75,7 +80,9 @@ class MessageManager:
         return f"广播发送失败：{self._api_error_text(response)}"
 
     def build_private_msg_result(
-        self, response: QueqiaoApiResponse | None, target: str
+        self,
+        response: QueqiaoApiResponse | None,
+        target: str,
     ) -> str:
         if response is not None and response.is_success:
             if not isinstance(response, SendPrivateMsgResponse):
@@ -93,21 +100,27 @@ class MessageManager:
         if not self.enabled_sub_types or event.sub_type not in self.enabled_sub_types:
             logger.debug(f"事件类型 {event.sub_type} 未启用，跳过处理")
             return None
+        nickname = event.player.nickname or "有人"
+        server_name = event.server_name or "Server"
         match event:
             case PlayerJoinEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 加入 {getattr(event, 'server_name', 'Server')}。"
+                return f"{nickname} 加入 {server_name}。"
             case PlayerQuitEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 退出 {getattr(event, 'server_name', 'Server')}。"
+                return f"{nickname} 退出 {server_name}。"
             case PlayerDeathEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', 'Server')} 死了 {getattr(event.death, 'text', '')}。"
+                death_text = event.death.text or ""
+                return f"{nickname} [{server_name}]: 死了 {death_text}。"
             case PlayerAchievementEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', 'Server')} 达成成就 {getattr(event.achievement.display, 'title', '')}。"
+                title = event.achievement.display.title or ""
+                return f"{nickname} [{server_name}]: 达成 {title}。"
             case PlayerChatEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} [{getattr(event, 'server_name', 'Server')}]: {getattr(event, 'message', '')}。"
+                message = event.message or ""
+                return f"{nickname} [{server_name}]: {message}。"
             case PlayerCommandEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} [{getattr(event, 'server_name', 'Server')}]: {getattr(event, 'command', '')}。"
+                command = event.command or ""
+                return f"{nickname} [{server_name}]: {command}。"
 
-    async def stack_messages(self, events_queue) -> str:
+    async def stack_messages(self, events_queue: list[QueuedEvent]) -> str:
         """将传入的 events_queue 中的消息堆叠成一条消息返回。"""
         stacked_message: str = ""
         for event, _ in events_queue:
@@ -119,7 +132,8 @@ class MessageManager:
     async def add_message(self, event: EventUnion) -> None:
         """将新消息添加到通知队列中，记录时间戳，去抖动处理。"""
         cancellation_events: dict[
-            str, str
+            str,
+            str,
         ] = {  # 定义可互相取消的事件类型，结构为 {新加入的事件类型: 被取消的事件类型}
             "player_join": "player_quit",
             "player_quit": "player_join",
@@ -132,8 +146,9 @@ class MessageManager:
                     # 可能没有 uuid，使用 nickname 匹配
                     and existing_event.player.nickname == event.player.nickname
                 ):
+                    nickname = event.player.nickname or ""
                     logger.debug(
-                        f"检测到{getattr(event.player, 'nickname', '')}抖动事件，移除对应的{cancellation_event}事件。"
+                        f"检测到{nickname}抖动事件，移除对应的{cancellation_event}事件。",
                     )
                     self.notification_queue.remove((existing_event, _))
                     return
@@ -142,10 +157,14 @@ class MessageManager:
         return
 
     async def send_message(
-        self, message_text: str, umo_list: list[str], no_ignore: bool = True
+        self,
+        message_text: str,
+        umo_list: list[str],
+        *,
+        no_ignore: bool = True,
     ) -> None:
         """发送消息到指定的统一消息源"""
-        message_chain = MessageChain(chain=[Comp.Plain(message_text)])
+        message_chain = MessageChain(chain=[comp.Plain(message_text)])
         for umo in umo_list:
             try:
                 logger.debug(f"Comping message for {umo}: {message_chain}")
@@ -155,10 +174,10 @@ class MessageManager:
                 await self.context.send_message(umo, message_chain)
             except Exception as e:
                 logger.error(
-                    f"Failed to send message to {umo}: {type(e).__name__}: {e}"
+                    f"Failed to send message to {umo}: {type(e).__name__}: {e}",
                 )
 
-    async def message_manager_loop(self):
+    async def message_manager_loop(self) -> None:
         """消息管理主循环，定期检查并发送通知队列中的消息。"""
         logger.debug("Starting MessageManager main loop...")
         try:
@@ -169,9 +188,9 @@ class MessageManager:
                 first_ts = self.notification_queue[0][1]  # 最早的消息时间戳
                 last_ts = self.notification_queue[-1][1]  # 最新的消息时间戳
 
-                async def clear_queue_and_send():
+                async def clear_queue_and_send() -> None:
                     """立即拷贝并清空队列，堆叠并发送消息。"""
-                    queue_tobesend: list = self.notification_queue.copy()
+                    queue_tobesend = self.notification_queue.copy()
                     self.notification_queue.clear()
                     stacked_message = await self.stack_messages(queue_tobesend)
                     await self.send_message(stacked_message, self.umo_list)
@@ -185,10 +204,7 @@ class MessageManager:
                     await clear_queue_and_send()
                     continue
                 # 否则等待直到去抖动时间到达
-                if (
-                    int(time.time())
-                    >= self.notification_queue[-1][1] + self.min_merge_window
-                ):
+                if int(time.time()) >= self.notification_queue[-1][1] + self.min_merge_window:
                     await clear_queue_and_send()
                     continue
         except Exception:
@@ -196,6 +212,6 @@ class MessageManager:
         finally:
             logger.info("MessageManager loop exited gracefully.")
 
-    async def stop(self):
+    async def stop(self) -> None:
         """停止消息管理主循环。"""
         self._running_flag = False

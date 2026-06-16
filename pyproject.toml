@@ -1,0 +1,30 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "data",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "A004",    # AstrBot exposes a command filter named `filter`.
+    "BLE001",  # Long-running plugin loops log unexpected exceptions and keep state consistent.
+    "COM812",  # Ruff formatter owns trailing-comma layout.
+    "C901",    # WebSocket listener lifecycle is clearer as one loop in this small plugin.
+    "D",       # This plugin does not require public API docstrings for every Pydantic model.
+    "EM101",
+    "EM102",
+    "PLR0911",
+    "PLR0913",
+    "RUF001",  # Chinese user-facing strings intentionally use full-width punctuation.
+    "RUF002",
+    "RUF003",
+    "TRY002",
+    "TRY003",
+    "TRY300",
+    "TRY301",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["astrbot_plugin_queqiao_lite"]

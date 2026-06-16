@@ -1,0 +1,1 @@
+"""AstrBot QueQiao Lite plugin."""
