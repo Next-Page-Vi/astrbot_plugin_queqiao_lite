@@ -1,12 +1,15 @@
 import asyncio
 import json
+from typing import Any
+from uuid import uuid4
 
 import websockets
 from websockets import ClientConnection
 
 from astrbot import logger
 
-from .message_handler import MessageHandler
+from .api_handler import ApiHandler
+from .event_handler import EventHandler
 
 
 class AuthenticationError(Exception):
@@ -47,6 +50,8 @@ class QueqiaoClient:
         self.reconnect_interval = reconnect_interval
         self.message_manager = message_manager
         self._running_flag = True
+        self._pending_api_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._send_lock = asyncio.Lock()
 
     def stop(self) -> None:
         """停止所有后台循环。"""
@@ -115,27 +120,88 @@ class QueqiaoClient:
                     await self.websocket.close()
             except Exception:
                 pass
+            self._fail_pending_api_requests(ConnectionError("WebSocket disconnected"))
             self.websocket = None
             return False
 
-    async def send_api_request(self, api, data={}):
+    def _fail_pending_api_requests(self, exc: Exception) -> None:
+        """Fail all pending API calls waiting for an echoed response."""
+        for future in self._pending_api_requests.values():
+            if not future.done():
+                future.set_exception(exc)
+        self._pending_api_requests.clear()
+
+    def _decode_message_text(self, message) -> str | None:
+        try:
+            if isinstance(message, (bytes, bytearray)):
+                return message.decode("utf-8")
+            if isinstance(message, str):
+                return message
+            return json.dumps(message)
+        except Exception:
+            logger.exception("无法解码 WebSocket 消息为文本")
+            return None
+
+    def _handle_api_response(self, payload: dict[str, Any]) -> bool:
+        if not ApiHandler.is_api_response_payload(payload):
+            return False
+
+        echo = payload.get("echo")
+        if echo is None:
+            logger.debug(f"收到未带 echo 的 API 响应: {payload}")
+            return True
+
+        future = self._pending_api_requests.pop(str(echo), None)
+        if future is None:
+            logger.debug(f"收到未知 echo 的 API 响应: {payload}")
+            return True
+
+        if not future.done():
+            future.set_result(payload)
+        return True
+
+    async def send_api_request(
+        self,
+        api: str,
+        data: dict[str, Any] | None = None,
+        *,
+        wait_response: bool = True,
+        timeout: float = 10.0,
+    ) -> dict[str, Any] | None:
         """
         向服务器发送一个 API 请求。
 
-        :param api: API 的名称，例如 'get_player_list'。
+        :param api: API 的名称，例如 'broadcast'、'get_status'。
         :param data: API 需要的数据，是一个字典。
         """
         if not self.websocket:
-            logger.error("错误：WebSocket 未连接。")
-            return
+            raise ConnectionError("WebSocket 未连接。")
 
-        request = {"api": api, "data": data}
+        request: dict[str, Any] = {"api": api, "data": data or {}}
+        echo: str | None = None
+        future: asyncio.Future[dict[str, Any]] | None = None
+        if wait_response:
+            echo = uuid4().hex
+            request["echo"] = echo
+            future = asyncio.get_running_loop().create_future()
+            self._pending_api_requests[echo] = future
 
         try:
-            await self.websocket.send(json.dumps(request))
+            async with self._send_lock:
+                await self.websocket.send(json.dumps(request, ensure_ascii=False))
             logger.info(f"已发送请求 -> API: {api}, 数据: {data}")
+            if not wait_response or future is None:
+                return None
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            if echo is not None:
+                self._pending_api_requests.pop(echo, None)
+            raise
         except Exception as e:
+            if echo is not None:
+                self._pending_api_requests.pop(echo, None)
             logger.error(f"发送请求失败: {e}")
+            raise
 
     async def event_listener_loop(self):
         """主循环：
@@ -153,15 +219,30 @@ class QueqiaoClient:
                     try:
                         message = await self.websocket.recv()
                         logger.debug(f"收到服务器消息: {message}")
-                        message_handler = MessageHandler(
-                            self.context, message, self.message_manager
+                        text = self._decode_message_text(message)
+                        if text is None:
+                            continue
+                        try:
+                            payload = json.loads(text)
+                        except json.JSONDecodeError:
+                            payload = None
+                        if isinstance(payload, dict) and self._handle_api_response(
+                            payload
+                        ):
+                            continue
+                        event_handler = EventHandler(
+                            self.context, text, self.message_manager
                         )
-                        await message_handler.process()
+                        await event_handler.process()
                     except websockets.ConnectionClosed:
                         logger.warning("WebSocket 连接已关闭，准备重连...")
+                        self._fail_pending_api_requests(
+                            ConnectionError("WebSocket connection closed")
+                        )
                         self.websocket = None
                     except Exception as e:
                         logger.error(f"监听消息时发生错误: {e}")
+                        self._fail_pending_api_requests(e)
                         self.websocket = None
         except Exception as e:
             logger.error(f"Event listener loop encountered an error: {e}")
@@ -179,4 +260,5 @@ class QueqiaoClient:
             except Exception as e:
                 logger.error(f"Error closing WebSocket connection: {e}")
             finally:
+                self._fail_pending_api_requests(ConnectionError("WebSocket closed"))
                 self.websocket = None

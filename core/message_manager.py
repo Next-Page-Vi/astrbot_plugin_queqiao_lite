@@ -1,11 +1,18 @@
 import asyncio
 import time
+from typing import Any
 
 import astrbot.api.message_components as Comp
 from astrbot import logger
 from astrbot.api.event import MessageChain
 
-from .message_handler import (
+from .api_handler import (
+    BroadcastResponse,
+    GetStatusResponse,
+    QueqiaoApiResponse,
+    SendPrivateMsgResponse,
+)
+from .event_handler import (
     EventUnion,
     PlayerAchievementEvent,
     PlayerChatEvent,
@@ -28,6 +35,59 @@ class MessageManager:
         self.notification_queue: list[tuple[EventUnion, int]] = []
         self._running_flag = True
 
+    @staticmethod
+    def _api_error_text(response: QueqiaoApiResponse | None) -> str:
+        if response is None:
+            return "没有收到有效响应"
+        return response.error_text
+
+    @staticmethod
+    def _format_number(value: Any) -> str:
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        if isinstance(value, int):
+            return str(value)
+        return str(value) if value is not None else "?"
+
+    def build_online_count_result(self, response: QueqiaoApiResponse | None) -> str:
+        if response is None:
+            return "查询在线人数失败：没有收到有效响应"
+        if not response.is_success:
+            return f"查询在线人数失败：{response.error_text}"
+        if not isinstance(response, GetStatusResponse):
+            return "查询在线人数失败：服务端返回的不是 get_status 响应。"
+
+        server_list_ping = (
+            response.data.server_list_ping if response.data is not None else None
+        )
+        if server_list_ping is None or server_list_ping.players is None:
+            return "已查询服务器状态，但响应中没有在线人数信息。"
+
+        online = self._format_number(server_list_ping.players.online)
+        max_players = self._format_number(server_list_ping.players.max)
+        return f"当前在线 {online}/{max_players}。"
+
+    def build_broadcast_result(self, response: QueqiaoApiResponse | None) -> str:
+        if response is not None and response.is_success:
+            if isinstance(response, BroadcastResponse):
+                return "已发送到服务器。"
+            return "广播发送失败：服务端返回的不是 broadcast 响应。"
+        return f"广播发送失败：{self._api_error_text(response)}"
+
+    def build_private_msg_result(
+        self, response: QueqiaoApiResponse | None, target: str
+    ) -> str:
+        if response is not None and response.is_success:
+            if not isinstance(response, SendPrivateMsgResponse):
+                return "私聊发送失败：服务端返回的不是 send_private_msg 响应。"
+            target_player = response.data.target_player if response.data else None
+            target_text = target
+            if target_player is not None:
+                uuid_text = str(target_player.uuid) if target_player.uuid else None
+                target_text = target_player.nickname or uuid_text or target
+            return f"已发送给 {target_text}。"
+        return f"私聊发送失败：{self._api_error_text(response)}"
+
     async def build_message(self, event: EventUnion) -> None | str:
         logger.debug(f"\nEvent: {type(event).__name__}; \nData: \n{event.model_dump()}")
         if not self.enabled_sub_types or event.sub_type not in self.enabled_sub_types:
@@ -35,17 +95,17 @@ class MessageManager:
             return None
         match event:
             case PlayerJoinEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 加入了 {getattr(event, 'server_name', '服务器')}。"
+                return f"{getattr(event.player, 'nickname', '有人')} 加入 {getattr(event, 'server_name', 'Server')}。"
             case PlayerQuitEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 退出了 {getattr(event, 'server_name', '服务器')}。"
+                return f"{getattr(event.player, 'nickname', '有人')} 退出 {getattr(event, 'server_name', 'Server')}。"
             case PlayerDeathEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', '服务器')} 死了 {getattr(event.death, 'text', '')}。"
+                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', 'Server')} 死了 {getattr(event.death, 'text', '')}。"
             case PlayerAchievementEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', '服务器')} 达成成就 {getattr(event.achievement.display, 'title', '')}。"
+                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', 'Server')} 达成成就 {getattr(event.achievement.display, 'title', '')}。"
             case PlayerChatEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', '服务器')} 说: {getattr(event, 'message', '')}。"
+                return f"{getattr(event.player, 'nickname', '有人')} [{getattr(event, 'server_name', 'Server')}]: {getattr(event, 'message', '')}。"
             case PlayerCommandEvent():
-                return f"{getattr(event.player, 'nickname', '有人')} 在 {getattr(event, 'server_name', '服务器')} 执行: {getattr(event, 'command', '')}。"
+                return f"{getattr(event.player, 'nickname', '有人')} [{getattr(event, 'server_name', 'Server')}]: {getattr(event, 'command', '')}。"
 
     async def stack_messages(self, events_queue) -> str:
         """将传入的 events_queue 中的消息堆叠成一条消息返回。"""

@@ -3,19 +3,24 @@ import asyncio
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.command import GreedyStr
 
+from .core.api import QueqiaoApi
 from .core.message_manager import MessageManager
 from .core.websocket import QueqiaoClient
 
 
 @register(
-    "astrbot_plugin_queqiao_lite", "nextpage", "A simple Queqiao adapter.", "1.0.0"
+    "astrbot_plugin_queqiao_lite", "nextpage", "A simple Queqiao adapter.", "1.1.0"
 )
 class Queqiaolite(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._tasks: list[asyncio.Task] = []
+        self.message_manager: MessageManager | None = None
+        self.queqiao_api: QueqiaoApi | None = None
+        self.queqiao_client: QueqiaoClient | None = None
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -86,6 +91,7 @@ class Queqiaolite(Star):
             reconnect_interval=reconnect_interval,
             message_manager=self.message_manager,
         )
+        self.queqiao_api = QueqiaoApi(self.queqiao_client)
         task_event_listener_loop = asyncio.create_task(
             self.queqiao_client.event_listener_loop(),
             name="task_event_listener_loop",
@@ -93,17 +99,71 @@ class Queqiaolite(Star):
         self._tasks.append(task_event_listener_loop)
 
     @filter.command("mc")
-    async def mc(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令"""  # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str  # 用户发的纯文本消息字符串
-        message_chain = (
-            event.get_messages()
-        )  # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
+    async def mc(self, event: AstrMessageEvent, message: GreedyStr):
+        """不带参数查询在线人数，带参数发送服务器广播。"""
+        if self.queqiao_api is None or self.message_manager is None:
+            yield event.plain_result("QueQiao 客户端还没有初始化。")
+            return
+
+        message_text = str(message).strip()
+        if not message_text:
+            yield event.plain_result(await self._query_online_count())
+            return
+
+        try:
+            response = await self.queqiao_api.broadcast(message_text)
+        except asyncio.TimeoutError:
+            yield event.plain_result("广播发送超时，服务端没有返回确认。")
+            return
+        except Exception as e:
+            logger.exception("发送 QueQiao 广播失败")
+            yield event.plain_result(f"广播发送失败：{type(e).__name__}: {e}")
+            return
+
+        yield event.plain_result(self.message_manager.build_broadcast_result(response))
+
+    @filter.command("mctell")
+    async def mctell(self, event: AstrMessageEvent, message: GreedyStr):
+        """向指定玩家发送私聊消息。"""
+        if self.queqiao_api is None or self.message_manager is None:
+            yield event.plain_result("QueQiao 客户端还没有初始化。")
+            return
+
+        command_text = str(message).strip()
+        parts = command_text.split(maxsplit=1)
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            yield event.plain_result("用法：/mctell <玩家ID或UUID> <聊天内容>")
+            return
+
+        target = parts[0].strip()
+        message_text = parts[1].strip()
+        try:
+            response = await self.queqiao_api.send_private_msg(target, message_text)
+        except asyncio.TimeoutError:
+            yield event.plain_result("私聊发送超时，服务端没有返回确认。")
+            return
+        except Exception as e:
+            logger.exception("发送 QueQiao 私聊失败")
+            yield event.plain_result(f"私聊发送失败：{type(e).__name__}: {e}")
+            return
+
         yield event.plain_result(
-            f"Hello, {user_name}, 你发了 {message_str}!"
-        )  # 发送一条纯文本消息
+            self.message_manager.build_private_msg_result(response, target)
+        )
+
+    async def _query_online_count(self) -> str:
+        if self.queqiao_api is None or self.message_manager is None:
+            return "QueQiao 客户端还没有初始化。"
+
+        try:
+            response = await self.queqiao_api.get_status()
+        except asyncio.TimeoutError:
+            return "查询在线人数超时，服务端没有返回状态。"
+        except Exception as e:
+            logger.exception("查询 QueQiao 状态失败")
+            return f"查询在线人数失败：{type(e).__name__}: {e}"
+
+        return self.message_manager.build_online_count_result(response)
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
@@ -112,6 +172,7 @@ class Queqiaolite(Star):
             self.queqiao_client.stop()
             await self.queqiao_client.disconnect()
             self.queqiao_client = None
+        self.queqiao_api = None
         if self.message_manager:
             await self.message_manager.stop()
             self.message_manager = None

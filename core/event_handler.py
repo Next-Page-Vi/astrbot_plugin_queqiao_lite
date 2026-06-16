@@ -1,5 +1,3 @@
-# from __future__ import annotations
-
 import json
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -158,18 +156,16 @@ EventUnion = Annotated[
     Field(discriminator="sub_type"),
 ]
 
-# 预编译的 TypeAdapter，解析时使用它可以更高效
 _event_adapter: TypeAdapter[EventUnion] = TypeAdapter(EventUnion)
 
 
-class MessageHandler:
+class EventHandler:
     def __init__(self, context, message: Data, message_manager) -> None:
         self.context = context
         self.message = message
         self.message_manager = message_manager
 
-    async def process(self):
-        # 尝试将收到的数据解析为 JSON 字符串
+    async def process(self) -> None:
         try:
             if isinstance(self.message, (bytes, bytearray)):
                 text = self.message.decode("utf-8")
@@ -181,13 +177,10 @@ class MessageHandler:
             logger.exception("无法解码 WebSocket 消息为文本")
             return
 
-        # 使用 pydantic discriminator 自动将消息转为具体事件模型
         try:
-            # 优先使用 validate_json（接受 JSON 文本），在解析失败时再回退
             event = _event_adapter.validate_json(text)
         except Exception:
             logger.exception("使用 discriminator 解析事件失败")
             return
 
-        # 根据解析到的具体类型执行不同逻辑（示例）
         await self.message_manager.add_message(event)
