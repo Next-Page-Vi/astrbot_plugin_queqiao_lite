@@ -1,46 +1,20 @@
-import json
 from typing import Annotated, Literal
-from uuid import UUID
 
 from astrbot.api import logger
 from pydantic import (
     BaseModel,
-    ConfigDict,
     Field,
     TypeAdapter,
     ValidationError,
-    model_validator,
 )
 
-from .types import JsonObject, JsonValue, RawQueqiaoPayload
+from .event_handler import Player
+from .types import JsonValue
 
 SUCCESS_CODE = 200
 
 
-class QueqiaoApiBaseModelMixin:
-    model_config = ConfigDict(extra="ignore")
-
-    @staticmethod
-    def normalize_nullish(data: JsonValue) -> JsonValue:
-        """递归将空字符串转 None"""
-        if isinstance(data, dict):
-            return {
-                key: QueqiaoApiBaseModelMixin.normalize_nullish(value)
-                for key, value in data.items()
-            }
-        if isinstance(data, list):
-            return [QueqiaoApiBaseModelMixin.normalize_nullish(value) for value in data]
-        if data == "":
-            return None
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_nullish(cls, data: JsonValue) -> JsonValue:
-        return cls.normalize_nullish(data)
-
-
-class QueqiaoApiResponse(QueqiaoApiBaseModelMixin, BaseModel):
+class QueqiaoApiResponse(BaseModel):
     api: str
     code: int | None = None
     post_type: Literal["response"] = "response"
@@ -51,7 +25,11 @@ class QueqiaoApiResponse(QueqiaoApiBaseModelMixin, BaseModel):
 
     @property
     def is_success(self) -> bool:
-        return self.code == SUCCESS_CODE and (self.status or "").upper() == "SUCCESS"
+        return (
+            self.code == SUCCESS_CODE
+            and self.status is not None
+            and self.status.upper() == "SUCCESS"
+        )
 
     @property
     def error_text(self) -> str:
@@ -60,19 +38,21 @@ class QueqiaoApiResponse(QueqiaoApiBaseModelMixin, BaseModel):
         return f"code={self.code}, status={self.status}"
 
 
-class StatusPlayers(QueqiaoApiBaseModelMixin, BaseModel):
+class StatusPlayers(BaseModel):
     max: int | float | None = None
     online: int | float | None = None
 
 
-class ServerListPing(QueqiaoApiBaseModelMixin, BaseModel):
+class ServerListPing(BaseModel):
     available: bool | None = None
     host: str | None = None
     port: int | None = None
     players: StatusPlayers | None = None
+    reason: str | None = None
+    error: str | None = None
 
 
-class GetStatusData(QueqiaoApiBaseModelMixin, BaseModel):
+class GetStatusData(BaseModel):
     timestamp: int | None = None
     server_type: str | None = None
     server_version: str | None = None
@@ -88,24 +68,8 @@ class BroadcastResponse(QueqiaoApiResponse):
     api: Literal["broadcast"] = "broadcast"
 
 
-class TargetPlayer(QueqiaoApiBaseModelMixin, BaseModel):
-    nickname: str | None = None
-    uuid: UUID | None = None
-    is_op: bool | None = None
-    address: str | None = None
-    health: float | None = None
-    max_health: float | None = None
-    experience_level: int | None = None
-    experience_progress: float | None = None
-    total_experience: int | None = None
-    walk_speed: float | None = None
-    x: float | None = None
-    y: float | None = None
-    z: float | None = None
-
-
-class SendPrivateMsgData(QueqiaoApiBaseModelMixin, BaseModel):
-    target_player: TargetPlayer | None = None
+class SendPrivateMsgData(BaseModel):
+    target_player: Player | None = None
     message: str | None = None
 
 
@@ -122,40 +86,22 @@ ApiResponseUnion = Annotated[
 _api_response_adapter: TypeAdapter[ApiResponseUnion] = TypeAdapter(ApiResponseUnion)
 
 
-class ApiHandler:
-    def __init__(self, response: RawQueqiaoPayload) -> None:
-        self.response = response
+def parse_api_response(payload: JsonValue) -> QueqiaoApiResponse | None:
+    """Validate a decoded response, preserving generic error details on fallback.
 
-    @staticmethod
-    def is_api_response_payload(payload: JsonObject) -> bool:
-        return payload.get("post_type") == "response"
+    Args:
+        payload: JSON value decoded by the WebSocket listener.
 
-    @staticmethod
-    def _decode_response(response: RawQueqiaoPayload) -> str | None:
-        try:
-            if response is None:
-                return None
-            if isinstance(response, (bytes, bytearray)):
-                return response.decode("utf-8")
-            if isinstance(response, str):
-                return response
-            return json.dumps(response, ensure_ascii=False)
-        except (TypeError, UnicodeDecodeError):
-            logger.exception("无法解码 QueQiao API 响应")
-            return None
+    Returns:
+        A typed or generic response, or None when validation fails.
+    """
+    try:
+        return _api_response_adapter.validate_python(payload)
+    except ValidationError:
+        logger.debug("Falling back to the generic QueQiao response model")
 
-    def process(self) -> QueqiaoApiResponse | None:
-        text = self._decode_response(self.response)
-        if text is None:
-            return None
-
-        try:
-            return _api_response_adapter.validate_json(text)
-        except (ValidationError, ValueError):
-            logger.debug("使用具体 API 响应模型解析失败，回退到通用响应模型")
-
-        try:
-            return QueqiaoApiResponse.model_validate_json(text)
-        except (ValidationError, ValueError):
-            logger.exception("解析 QueQiao API 响应失败")
-            return None
+    try:
+        return QueqiaoApiResponse.model_validate(payload)
+    except ValidationError:
+        logger.exception("Failed to parse QueQiao API response")
+        return None

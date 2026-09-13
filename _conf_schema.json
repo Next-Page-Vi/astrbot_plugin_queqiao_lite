@@ -7,7 +7,7 @@
             "server_name": {
                 "description": "服务端 Server name",
                 "type": "string",
-                "hint": "务必和 config.json 中的 server_name 保持一致.",
+                "hint": "务必和 config.yml 中的 server_name 保持一致.",
                 "default": "Server"
             },
             "server_uri": {
@@ -18,8 +18,9 @@
             },
             "access_token": {
                 "description": "身份认证 Access token",
+                "secret": true,
                 "type": "string",
-                "hint": "config.json 中的 access_token, 没有设置可不填."
+                "hint": "config.yml 中的 access_token, 没有设置可不填."
             }
         }
     },
@@ -66,13 +67,13 @@
           },
           "min_merge_window": {
             "description": "最小合并窗口 (秒)",
-            "hint": "抵消快速上下线事件，合并连续发送消息，会引入该长度的基础通知延迟，设置为 0 时不工作。",
+            "hint": "抵消快速上下线事件，合并连续发送消息，会引入该长度的基础通知延迟，设置为 0 时不额外等待，在下一次检查时发送。",
             "type": "int",
             "default": 10
           },
           "max_merge_window": {
             "description": "最大合并窗口 (秒)",
-            "hint": " 消息抵达后最长等待时间，超过该时间则立即发送通知。",
+            "hint": "首条消息的最长合并等待时间，最多有约 1 秒的检查延迟；必须大于最小合并窗口。",
             "type": "int",
             "default": 60
           }

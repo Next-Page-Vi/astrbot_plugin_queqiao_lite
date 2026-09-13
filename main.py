@@ -1,12 +1,13 @@
 import asyncio
 from collections.abc import AsyncGenerator
-from contextlib import suppress
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 from astrbot.api.event import filter as event_filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
+from websockets.exceptions import InvalidURI
+from websockets.uri import parse_uri
 
 from .core.api import QueqiaoApi
 from .core.message_manager import MessageManager
@@ -22,11 +23,13 @@ def _config_section(value: JsonValue) -> JsonObject:
     return {}
 
 
-def _config_string(section: JsonObject, key: str, default: str = "") -> str:
+def _config_string(section: JsonObject, key: str) -> str | None:
     value = section.get(key)
-    if isinstance(value, str):
-        return value
-    return default
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"Configuration field {key} must be a string")
+    return value if value.strip() else None
 
 
 def _config_int(section: JsonObject, key: str, default: int) -> int:
@@ -43,12 +46,6 @@ def _config_str_list(section: JsonObject, key: str) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
-@register(
-    "astrbot_plugin_queqiao_lite",
-    "nextpage",
-    "A simple Queqiao adapter.",
-    "1.1.1",
-)
 class Queqiaolite(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -59,12 +56,18 @@ class Queqiaolite(Star):
         self.queqiao_client: QueqiaoClient | None = None
 
     async def initialize(self) -> None:
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        """Validate configuration before starting the plugin's background services."""
         # queqiao_server
         queqiao_server = _config_section(self.config.get("queqiao_server", {}))
         server_name = _config_string(queqiao_server, "server_name")
         server_uri = _config_string(queqiao_server, "server_uri")
         access_token = _config_string(queqiao_server, "access_token")
+        if server_name is None or server_uri is None:
+            raise ValueError("QueQiao server_name and server_uri must not be blank")
+        try:
+            parse_uri(server_uri)
+        except InvalidURI as exc:
+            raise ValueError("server_uri must be a valid ws:// or wss:// URL") from exc
 
         # connection_policy
         connection_policy = _config_section(self.config.get("connection_policy", {}))
@@ -74,6 +77,8 @@ class Queqiaolite(Star):
             5,
         )
         reconnect_interval = _config_int(connection_policy, "reconnect_interval", 60)
+        if max_reconnect_attempts < -1 or reconnect_interval < 0:
+            raise ValueError("Reconnect attempts must be >= -1 and interval must be >= 0")
 
         # notification
         notification = _config_section(self.config.get("notification", {}))
@@ -82,7 +87,7 @@ class Queqiaolite(Star):
         min_merge_window = _config_int(notification, "min_merge_window", 10)
         max_merge_window = _config_int(notification, "max_merge_window", 60)
 
-        # 映射事件列表
+        # Map configuration labels to protocol event types.
         events_map = {
             "玩家加入|PlayerJoinEvent": "player_join",
             "玩家退出|PlayerQuitEvent": "player_quit",
@@ -94,16 +99,15 @@ class Queqiaolite(Star):
         enabled_sub_types = [events_map[event] for event in enabled_events if event in events_map]
         logger.info(enabled_sub_types)
 
-        # 参数校验
+        # Keep invalid merge settings from entering the runtime state.
         if min_merge_window < 0 or max_merge_window < 0 or max_merge_window <= min_merge_window:
             logger.warning(
-                "参数校验失败，请检查参数，已设置为默认值 "
-                "(max_merge_window = 60, min_merge_window = 10)",
+                "Invalid merge windows; using max_merge_window=60 and min_merge_window=10",
             )
             max_merge_window = 60
             min_merge_window = 10
 
-        # 初始化 MessageManager
+        # Start the notification service.
         self.message_manager = MessageManager(
             context=self.context,
             enabled_sub_types=enabled_sub_types,
@@ -117,9 +121,8 @@ class Queqiaolite(Star):
         )
         self._tasks.append(task_message_manager_loop)
 
-        # 初始化 QueqiaoClient 并启动监听任务
+        # Start the WebSocket listener.
         self.queqiao_client = QueqiaoClient(
-            context=self.context,
             server_name=server_name,
             server_uri=server_uri,
             access_token=access_token,
@@ -156,7 +159,7 @@ class Queqiaolite(Star):
             yield event.plain_result("广播发送超时，服务端没有返回确认。")
             return
         except Exception as e:
-            logger.exception("发送 QueQiao 广播失败")
+            logger.exception("Failed to broadcast through QueQiao")
             yield event.plain_result(f"广播发送失败：{type(e).__name__}: {e}")
             return
 
@@ -187,7 +190,7 @@ class Queqiaolite(Star):
             yield event.plain_result("私聊发送超时，服务端没有返回确认。")
             return
         except Exception as e:
-            logger.exception("发送 QueQiao 私聊失败")
+            logger.exception("Failed to send a QueQiao private message")
             yield event.plain_result(f"私聊发送失败：{type(e).__name__}: {e}")
             return
 
@@ -204,24 +207,30 @@ class Queqiaolite(Star):
         except TimeoutError:
             return "查询在线人数超时，服务端没有返回状态。"
         except Exception as e:
-            logger.exception("查询 QueQiao 状态失败")
+            logger.exception("Failed to query QueQiao status")
             return f"查询在线人数失败：{type(e).__name__}: {e}"
 
         return self.message_manager.build_online_count_result(response)
 
     async def terminate(self) -> None:
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
-        logger.info("astrbot_plugin_queqiao_lite 正在关闭...")
-        if self.queqiao_client:
+        """Stop owned tasks and release connections, including already failed tasks."""
+        logger.info("Stopping astrbot_plugin_queqiao_lite")
+        if self.queqiao_client is not None:
             self.queqiao_client.stop()
-            await self.queqiao_client.disconnect()
-            self.queqiao_client = None
-        self.queqiao_api = None
-        if self.message_manager:
-            await self.message_manager.stop()
-            self.message_manager = None
+        if self.message_manager is not None:
+            self.message_manager.stop()
         for task in self._tasks:
             task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        logger.info("astrbot_plugin_queqiao_lite 已关闭。")
+        results = await asyncio.gather(*self._tasks, return_exceptions=True)
+        for task, result in zip(self._tasks, results, strict=True):
+            if isinstance(result, Exception):
+                logger.error("QueQiao task %s failed: %s", task.get_name(), result)
+        try:
+            if self.queqiao_client is not None:
+                await self.queqiao_client.disconnect()
+        finally:
+            self._tasks.clear()
+            self.queqiao_client = None
+            self.queqiao_api = None
+            self.message_manager = None
+        logger.info("Stopped astrbot_plugin_queqiao_lite")

@@ -2,36 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import suppress
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
+from urllib.parse import quote
 from uuid import uuid4
 
 import websockets
-from astrbot import logger
+from astrbot.api import logger
+from websockets.exceptions import ConnectionClosed
+from websockets.frames import CloseCode
 
-from .api_handler import ApiHandler
-from .event_handler import EventHandler
+from .event_handler import parse_event
 
 if TYPE_CHECKING:
-    from astrbot.api.star import Context
     from websockets import ClientConnection, Data
 
     from .message_manager import MessageManager
-    from .types import JsonObject, JsonValue
+    from .types import JsonObject
 
 
 class AuthenticationError(Exception):
-    """Raised when WebSocket authentication fails."""
+    """Raised when the server rejects the name or token with a policy violation."""
 
 
 class QueqiaoClient:
-    """
-    用于与 queqiao_mcdr 插件进行 WebSocket 通信的客户端。
-    """
+    """Maintain an outgoing connection to a QueQiao V2 WebSocket server."""
 
     def __init__(
         self,
-        context: Context,
         server_name: str,
         server_uri: str,
         access_token: str | None = None,
@@ -39,20 +36,25 @@ class QueqiaoClient:
         reconnect_interval: int = 60,
         message_manager: MessageManager | None = None,
     ) -> None:
-        """
-        初始化客户端。
+        """Create a connection owner.
 
-        :param server_uri: WebSocket 服务器的地址 (例如 'ws://localhost:8080/ws')。
-        :param access_token: 用于连接验证的访问令牌（如果服务器配置了）。
-        :param max_reconnect_attempts: 最大重连尝试次数，-1 表示无限重连。
-        :param reconnect_interval: 重连间隔时间（秒）。
+        Args:
+            server_name: Exact server name before URL encoding.
+            server_uri: Configured ws or wss endpoint.
+            access_token: Optional bearer token without the prefix.
+            max_reconnect_attempts: Retries after the initial attempt; -1 means unlimited.
+            reconnect_interval: Seconds between connection attempts.
+            message_manager: Destination for supported events.
         """
+        if max_reconnect_attempts < -1 or reconnect_interval < 0:
+            raise ValueError("Invalid reconnect policy")
         self.websocket: ClientConnection | None = None
-        self.context = context
         self.server_name = server_name
         self.server_uri = server_uri
         self.access_token = access_token
-        self.max_reconnect_attempts = max_reconnect_attempts
+        self.max_reconnect_attempts = (
+            None if max_reconnect_attempts == -1 else max_reconnect_attempts
+        )
         self.reconnect_interval = reconnect_interval
         self.message_manager = message_manager
         self._running_flag = True
@@ -60,42 +62,32 @@ class QueqiaoClient:
         self._send_lock = asyncio.Lock()
 
     def stop(self) -> None:
-        """停止所有后台循环。"""
+        """Prevent further connection attempts."""
         self._running_flag = False
 
     async def _connect_loop(self) -> bool:
-        """
-        尝试连接到 WebSocket 服务器，连接状态通过布尔值表示，成功时为 True。
-        """
-        logger.info(f"Connecting to the WebSocket server {self.server_uri} ...")
-        connection_count = 0
+        """Attempt the initial connection and the configured number of retries."""
+        failures = 0
         while self._running_flag:
-            if self.max_reconnect_attempts == -1 or connection_count <= self.max_reconnect_attempts:
-                if await self._connect():
-                    logger.info("WebSocket connection established!")
-                    return True
-                connection_count += 1
-                logger.error(
-                    "Initial connection failed. "
-                    f"Will retry in {self.reconnect_interval} seconds...",
-                )
-                await asyncio.sleep(self.reconnect_interval)
-            else:
-                logger.error(
-                    "Maximum reconnection attempts reached. Stopping connection attempts.",
-                )
+            if await self._connect():
+                logger.info("QueQiao WebSocket connection established")
+                return True
+            if self.max_reconnect_attempts is not None and failures >= self.max_reconnect_attempts:
+                logger.error("QueQiao reconnect attempts exhausted")
                 return False
-        logger.debug("Connection loop stopped by flag.")
+            failures += 1
+            await asyncio.sleep(self.reconnect_interval)
         return False
 
     async def _connect(self) -> bool:
-        """Connect to the WebSocket server."""
-        headers: dict[str, str] = {"x-client-origin": "astrbot_mcqq_lite"}
-        if self.server_name:
-            headers["x-self-name"] = self.server_name
-        if self.access_token:
+        """Connect and probe the socket, releasing it on failure or cancellation."""
+        headers = {
+            "x-client-origin": "astrbot_mcqq_lite",
+            "x-self-name": quote(self.server_name, safe=""),
+        }
+        if self.access_token is not None:
             headers["Authorization"] = f"Bearer {self.access_token}"
-        self.websocket = None
+        connected = False
         try:
             self.websocket = await websockets.connect(
                 self.server_uri,
@@ -105,27 +97,24 @@ class QueqiaoClient:
             )
             pong_waiter = await self.websocket.ping()
             await asyncio.wait_for(pong_waiter, timeout=2.0)
-            logger.debug("WebSocket Authentication successful.")
+            connected = True
             return True
-        except Exception as e:
-            error_msg = str(e)
-            if (
-                "1008" in error_msg
-                or "policy violation" in error_msg
-                or "Authorization Header is wrong" in error_msg
-            ):
-                logger.error(f"WebSocket authentication failed: {e}")
-                raise AuthenticationError(f"Authentication failed: {e}") from e
-            logger.error(f"WebSocket connection error: {e}")
-            with suppress(Exception):
-                if self.websocket is not None:
-                    await self.websocket.close()
-            self._fail_pending_api_requests(ConnectionError("WebSocket disconnected"))
-            self.websocket = None
+        except ConnectionClosed as exc:
+            if exc.rcvd is not None and exc.rcvd.code == CloseCode.POLICY_VIOLATION:
+                raise AuthenticationError(
+                    "QueQiao rejected the server name or access token"
+                ) from exc
+            logger.warning("QueQiao connection closed during setup: %s", exc)
             return False
+        except Exception:
+            logger.exception("Failed to connect to QueQiao")
+            return False
+        finally:
+            if not connected:
+                await self.disconnect()
 
     def _fail_pending_api_requests(self, exc: Exception) -> None:
-        """Fail all pending API calls waiting for an echoed response."""
+        """Wake API callers when their connection becomes unavailable."""
         for future in self._pending_api_requests.values():
             if not future.done():
                 future.set_exception(exc)
@@ -133,28 +122,22 @@ class QueqiaoClient:
 
     def _decode_message_text(self, message: Data) -> str | None:
         try:
-            if isinstance(message, bytes):
-                return message.decode("utf-8")
-            return message
+            return message.decode("utf-8") if isinstance(message, bytes) else message
         except UnicodeDecodeError:
-            logger.exception("无法解码 WebSocket 消息为文本")
+            logger.exception("Failed to decode QueQiao WebSocket message")
             return None
 
     def _handle_api_response(self, payload: JsonObject) -> bool:
-        if not ApiHandler.is_api_response_payload(payload):
+        if payload.get("post_type") != "response":
             return False
-
         echo = payload.get("echo")
-        if echo is None:
-            logger.debug(f"收到未带 echo 的 API 响应: {payload}")
+        if not isinstance(echo, str):
+            logger.warning("QueQiao returned an uncorrelated response: %s", payload)
             return True
-
-        future = self._pending_api_requests.pop(str(echo), None)
+        future = self._pending_api_requests.pop(echo, None)
         if future is None:
-            logger.debug(f"收到未知 echo 的 API 响应: {payload}")
-            return True
-
-        if not future.done():
+            logger.debug("Ignoring unknown QueQiao echo: %s", echo)
+        elif not future.done():
             future.set_result(payload)
         return True
 
@@ -163,99 +146,90 @@ class QueqiaoClient:
         api: str,
         data: JsonObject | None = None,
         *,
-        wait_response: bool = True,
         response_timeout: float = 10.0,
-    ) -> JsonObject | None:
+    ) -> JsonObject:
+        """Send a request and wait for the response with its exact echo.
+
+        Args:
+            api: QueQiao API name.
+            data: API-specific payload, or None for no parameters.
+            response_timeout: Maximum seconds to wait after sending.
+
+        Returns:
+            The correlated response.
+
+        Raises:
+            ConnectionError: No active connection is available.
+            TimeoutError: No matching response arrived before the deadline.
         """
-        向服务器发送一个 API 请求。
-
-        :param api: API 的名称，例如 'broadcast'、'get_status'。
-        :param data: API 需要的数据，是一个字典。
-        """
-        if not self.websocket:
-            raise ConnectionError("WebSocket 未连接。")
-
-        request: JsonObject = {"api": api, "data": data or {}}
-        echo: str | None = None
-        future: asyncio.Future[JsonObject] | None = None
-        if wait_response:
-            echo = uuid4().hex
-            request["echo"] = echo
-            future = asyncio.get_running_loop().create_future()
-            self._pending_api_requests[echo] = future
-
+        echo = uuid4().hex
+        request: JsonObject = {"api": api, "data": data if data is not None else {}, "echo": echo}
+        future: asyncio.Future[JsonObject] = asyncio.get_running_loop().create_future()
         try:
             async with self._send_lock:
-                await self.websocket.send(json.dumps(request, ensure_ascii=False))
-            logger.info(f"已发送请求 -> API: {api}, 数据: {data}")
-            if not wait_response or future is None:
-                return None
+                websocket = self.websocket
+                if websocket is None or not self._running_flag:
+                    raise ConnectionError("QueQiao WebSocket is not connected")
+                self._pending_api_requests[echo] = future
+                await websocket.send(json.dumps(request, ensure_ascii=False))
             return await asyncio.wait_for(future, timeout=response_timeout)
-        except TimeoutError:
-            if echo is not None:
-                self._pending_api_requests.pop(echo, None)
-            raise
-        except Exception as e:
-            if echo is not None:
-                self._pending_api_requests.pop(echo, None)
-            logger.error(f"发送请求失败: {e}")
-            raise
+        finally:
+            self._pending_api_requests.pop(echo, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                # A disconnect may fail the future while send() itself is also failing.
+                future.exception()
 
     async def event_listener_loop(self) -> None:
-        """主循环：
-        如果没有连接会建立连接，
-        监听来自 WebSocket 服务器的消息并调用 handle_message 处理它们。
-        """
-        logger.debug("Starting main websocket event listener loop...")
+        """Reconnect on transport failures and stop on policy rejection or cancellation."""
         try:
             while self._running_flag:
-                if self.websocket is None:
-                    client_status = await self._connect_loop()
-                    if not client_status:
-                        raise ConnectionError("WebSocket connection failed")
-                if self.websocket:
-                    try:
-                        message = await self.websocket.recv()
-                        logger.debug(f"收到服务器消息: {message}")
-                        text = self._decode_message_text(message)
-                        if text is None:
-                            continue
-                        try:
-                            payload = cast("JsonValue", json.loads(text))
-                        except json.JSONDecodeError:
-                            payload = None
-                        if isinstance(payload, dict) and self._handle_api_response(
-                            payload,
-                        ):
-                            continue
-                        if self.message_manager is None:
-                            logger.debug("MessageManager 未初始化，跳过事件处理")
-                            continue
-                        event_handler = EventHandler(text, self.message_manager)
-                        await event_handler.process()
-                    except websockets.ConnectionClosed:
-                        logger.warning("WebSocket 连接已关闭，准备重连...")
-                        self._fail_pending_api_requests(
-                            ConnectionError("WebSocket connection closed"),
-                        )
-                        self.websocket = None
-                    except Exception as e:
-                        logger.error(f"监听消息时发生错误: {e}")
-                        self._fail_pending_api_requests(e)
-                        self.websocket = None
-        except Exception as e:
-            logger.error(f"Event listener loop encountered an error: {e}")
+                if self.websocket is None and not await self._connect_loop():
+                    break
+                websocket = self.websocket
+                if websocket is None:
+                    break
+                try:
+                    message = await websocket.recv()
+                except ConnectionClosed as exc:
+                    if exc.rcvd is not None and exc.rcvd.code == CloseCode.POLICY_VIOLATION:
+                        raise AuthenticationError(
+                            "QueQiao rejected the server name or access token",
+                        ) from exc
+                    logger.warning("QueQiao connection closed; reconnecting")
+                    await self.disconnect()
+                    continue
+                except Exception:
+                    logger.exception("QueQiao receive failed; reconnecting")
+                    await self.disconnect()
+                    continue
+                text = self._decode_message_text(message)
+                if text is None:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning("Ignoring invalid QueQiao JSON")
+                    continue
+                if isinstance(payload, dict) and self._handle_api_response(payload):
+                    continue
+                if self.message_manager is not None and (event := parse_event(payload)) is not None:
+                    self.message_manager.add_message(event)
+        except Exception:
+            logger.exception("QueQiao listener stopped with an error")
             raise
         finally:
-            logger.info("Listening loop exited gracefully.")
+            self._running_flag = False
+            await self.disconnect()
+            logger.info("QueQiao listener exited")
 
     async def disconnect(self) -> None:
-        """断开 WebSocket 连接。"""
-        if self.websocket:
+        """Detach the connection before closing and fail all outstanding requests."""
+        websocket, self.websocket = self.websocket, None
+        self._fail_pending_api_requests(ConnectionError("QueQiao WebSocket disconnected"))
+        if websocket is not None:
             try:
-                await self.websocket.close()
-            except Exception as e:
-                logger.error(f"Error closing WebSocket connection: {e}")
-            finally:
-                self._fail_pending_api_requests(ConnectionError("WebSocket closed"))
-                self.websocket = None
+                await websocket.close()
+            except Exception:
+                logger.exception("Failed to close QueQiao WebSocket")

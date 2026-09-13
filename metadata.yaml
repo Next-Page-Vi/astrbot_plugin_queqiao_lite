@@ -1,6 +1,7 @@
 name: astrbot_plugin_queqiao_lite
 display_name: Minecraft QueQiao Lite
 desc: 简单的 queqiao 适配器实现，同步服务器与群消息.
-version: v1.1.1
+version: v1.1.2
 author: Next-Page-Vi
 repo: https://github.com/Next-Page-Vi/astrbot_plugin_queqiao_lite
+astrbot_version: ">=4.28.0"
